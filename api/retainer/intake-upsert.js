@@ -1,6 +1,10 @@
-// /api/retainer/intake-upsert.js
+// JS (ESM) – Vercel serverless function
+// Creates/updates a Customer, writes customer metafields (namespace "retainer"),
+// uploads signature to Files, and saves a file_reference metafield at custom.retainer_signature.
+// Sends the classic "Activate your account" invite if the customer is not enabled.
+
 const SHOP   = process.env.SHOPIFY_SHOP;          // e.g. 9x161v-j4.myshopify.com
-const TOKEN  = process.env.SHOPIFY_ADMIN_TOKEN;   // Admin API access token
+const TOKEN  = process.env.SHOPIFY_ADMIN_TOKEN;   // Admin API token
 const ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
@@ -13,19 +17,18 @@ function cors(res, origin) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
 
+function isValidPhone(s){ return /^\+?[1-9]\d{7,14}$/.test(s || ''); }
+
 async function gql(query, variables) {
   const r = await fetch(`https://${SHOP}/admin/api/2024-07/graphql.json`, {
     method: 'POST',
-    headers: {
-      'X-Shopify-Access-Token': TOKEN,
-      'Content-Type': 'application/json'
-    },
+    headers: { 'X-Shopify-Access-Token': TOKEN, 'Content-Type': 'application/json' },
     body: JSON.stringify({ query, variables })
   });
-  let j;
-  try { j = await r.json(); } catch { /* ignore */ }
-  if (!r.ok || (j && j.errors)) {
-    throw new Error(`GraphQL HTTP ${r.status} ${r.statusText}: ${JSON.stringify(j?.errors || j)}`);
+  const j = await r.json();
+  if (!r.ok || j.errors) {
+    const err = (j && j.errors) ? JSON.stringify(j.errors) : await r.text();
+    throw new Error(`GraphQL HTTP ${r.status} ${r.statusText}: ${err}`);
   }
   return j.data;
 }
@@ -62,97 +65,117 @@ const Q = {
         metafields{ namespace key type }
         userErrors{ field message }
       }
+    }`,
+  stagedUploadsCreate: `
+    mutation($input:[StagedUploadInput!]!){
+      stagedUploadsCreate(input:$input){
+        stagedTargets{
+          url resourceUrl parameters{ name value }
+        }
+        userErrors{ field message }
+      }
+    }`,
+  fileCreate: `
+    mutation($files:[FileCreateInput!]!){
+      fileCreate(files:$files){
+        files{ id alt url }
+        userErrors{ field message }
+      }
     }`
 };
+
+async function uploadSignatureToFiles(dataUrl){
+  if (!dataUrl || !dataUrl.startsWith('data:image/png')) return null;
+
+  // 1) decode base64
+  const base64 = dataUrl.split(',')[1];
+  const buf = Buffer.from(base64, 'base64');
+
+  // 2) staged upload target
+  const su = await gql(Q.stagedUploadsCreate, {
+    input: [{
+      resource: "FILE",
+      filename: `signature-${Date.now()}.png`,
+      mimeType: "image/png",
+      httpMethod: "POST"
+    }]
+  });
+  const target = su.stagedUploadsCreate.stagedTargets?.[0];
+  if (!target?.url) return null;
+
+  // 3) post to staged URL
+  const form = new FormData();
+  for (const p of target.parameters) form.append(p.name, p.value);
+  form.append('file', new Blob([buf], { type:'image/png' }), 'signature.png');
+  await fetch(target.url, { method:'POST', body: form });
+
+  // 4) create file record
+  const fc = await gql(Q.fileCreate, {
+    files: [{ contentType: "IMAGE", originalSource: target.resourceUrl, alt: "Retainer signature" }]
+  });
+  const file = fc.fileCreate.files?.[0];
+  return file?.id || null; // GraphQL ID e.g. gid://shopify/MediaImage/...
+}
 
 export default async function handler(req, res) {
   cors(res, req.headers.origin);
   if (req.method === 'OPTIONS') return res.status(204).end();
-  if (req.method !== 'POST')   return res.status(405).json({ ok:false, error:'Method not allowed' });
-
-  // Quick env sanity
-  if (!SHOP || !TOKEN) {
-    return res.status(500).json({ ok:false, error:'Missing SHOPIFY_SHOP or SHOPIFY_ADMIN_TOKEN env' });
-  }
+  if (req.method !== 'POST') return res.status(405).end();
 
   try {
-    const p = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
+    const p = req.body || {};
     const email = String(p.email || '').trim().toLowerCase();
     if (!email) return res.status(400).json({ ok:false, error:'missing email' });
 
-    // 1) look up by email
-    const search = await gql(Q.customersByEmail, { q: `email:${JSON.stringify(email)}` });
-    let node = search?.customers?.nodes?.[0] || null;
-
-    // 2) create or update
-    if (!node) {
-      const created = await gql(Q.customerCreate, {
-        input: {
-          email,
-          firstName: p.first_name || undefined,
-          lastName:  p.last_name  || undefined,
-          phone:     p.phone      || undefined,
-          addresses: p.home_address ? [{
-            address1:  p.home_address,
-            firstName: p.first_name || undefined,
-            lastName:  p.last_name  || undefined
-          }] : undefined
-        }
-      });
-
-      const ce = created?.customerCreate;
-      const errs = ce?.userErrors || [];
-      if (errs.length) {
-        // If the email already exists, re-query and continue; otherwise bail with the real error
-        const alreadyExists = errs.some(e => /email/i.test(e.field?.join?.('.') || '') || /already.*taken/i.test(e.message));
-        if (alreadyExists) {
-          const again = await gql(Q.customersByEmail, { q: `email:${JSON.stringify(email)}` });
-          node = again?.customers?.nodes?.[0] || null;
-          if (!node) {
-            return res.status(400).json({ ok:false, error:`Shopify says email exists, but lookup returned none: ${JSON.stringify(errs)}` });
-          }
-        } else {
-          return res.status(400).json({ ok:false, error:`customerCreate userErrors: ${JSON.stringify(errs)}` });
-        }
-      } else {
-        node = ce?.customer || null;
-        if (!node) {
-          // Extra safety: one more lookup
-          const again = await gql(Q.customersByEmail, { q: `email:${JSON.stringify(email)}` });
-          node = again?.customers?.nodes?.[0] || null;
-          if (!node) {
-            return res.status(400).json({ ok:false, error:'customerCreate returned null customer and subsequent lookup failed' });
-          }
-        }
+    // 1) find or create/update customer
+    let id, state;
+    try {
+      const found = await gql(Q.customersByEmail, { q: `email:${JSON.stringify(email)}` });
+      id = found.customers.nodes[0]?.id;
+      state = found.customers.nodes[0]?.state;
+    } catch (e) {
+      if (String(e).includes('ACCESS_DENIED')) {
+        return res.status(200).json({
+          ok:false,
+          error:'Shopify blocked Customer access (Protected customer data). Approve access in app settings, reinstall the app, and update the Admin token.'
+        });
       }
+      throw e;
+    }
+
+    const baseInput = {
+      email,
+      firstName: p.first_name || undefined,
+      lastName:  p.last_name  || undefined,
+      phone:     isValidPhone(p.phone) ? p.phone : undefined,
+      addresses: p.home_address ? [{
+        address1: p.home_address,
+        firstName: p.first_name || undefined,
+        lastName:  p.last_name  || undefined
+      }] : undefined
+    };
+
+    if (!id) {
+      const created = await gql(Q.customerCreate, { input: baseInput });
+      const errs = created.customerCreate.userErrors;
+      if (errs?.length) return res.status(200).json({ ok:false, error:`customerCreate userErrors: ${JSON.stringify(errs)}` });
+      id = created.customerCreate.customer.id;
+      state = created.customerCreate.customer.state;
     } else {
-      const upd = await gql(Q.customerUpdate, {
-        id: node.id,
-        input: {
-          firstName: p.first_name || undefined,
-          lastName:  p.last_name  || undefined,
-          phone:     p.phone      || undefined,
-          addresses: p.home_address ? [{
-            address1:  p.home_address,
-            firstName: p.first_name || undefined,
-            lastName:  p.last_name  || undefined
-          }] : undefined
-        }
-      });
-      const errs = upd?.customerUpdate?.userErrors || [];
-      if (errs.length) {
-        return res.status(400).json({ ok:false, error:`customerUpdate userErrors: ${JSON.stringify(errs)}` });
-      }
-      node = upd?.customerUpdate?.customer || node;
+      const updated = await gql(Q.customerUpdate, { id, input: baseInput });
+      const errs = updated.customerUpdate.userErrors;
+      if (errs?.length) return res.status(200).json({ ok:false, error:`customerUpdate userErrors: ${JSON.stringify(errs)}` });
     }
 
-    // At this point we must have an id/state
-    if (!node?.id) {
-      return res.status(400).json({ ok:false, error:'No customer ID after create/update.' });
+    // 2) (optional) upload signature and get File ID
+    let signatureFileId = null;
+    if (p.signature_data_url) {
+      try { signatureFileId = await uploadSignatureToFiles(p.signature_data_url); }
+      catch(_) { /* non-blocking */ }
     }
 
-    // 3) set metafields
-    const cmf = [
+    // 3) write Customer metafields
+    const mf = [
       { key:'dob',                type:'date',                   value: p.dob || '' },
       { key:'insurer',            type:'single_line_text_field', value: p.insurer || '' },
       { key:'bi_limits',          type:'single_line_text_field', value: p.bi_limits || '' },
@@ -163,32 +186,33 @@ export default async function handler(req, res) {
       { key:'intake_notes',       type:'multi_line_text_field',  value: p.intake_notes || '' },
       { key:'last_retainer_plan', type:'single_line_text_field', value: p.retainer_plan || '' },
       { key:'last_retainer_term', type:'single_line_text_field', value: p.retainer_term || '' }
-    ].map(m => ({ ...m, namespace:'retainer', ownerId: node.id }));
+    ].map(m => ({ ...m, namespace:'retainer', ownerId: id }));
 
-    const mf = await gql(Q.metafieldsSet, { metafields: cmf });
-    const mfErrs = mf?.metafieldsSet?.userErrors || [];
-    if (mfErrs.length) {
-      // Don’t hard fail checkout on metafield mismatch; return warning
-      console.warn('metafieldsSet userErrors', mfErrs);
+    // Signature as file_reference at custom.retainer_signature
+    if (signatureFileId) {
+      mf.push({
+        namespace:'custom',
+        ownerId: id,
+        key:'retainer_signature',
+        type:'file_reference',
+        value: JSON.stringify({ file_id: signatureFileId })
+      });
     }
 
-    // 4) send account invite if not enabled (Classic accounts)
-    const state = node.state;
+    await gql(Q.metafieldsSet, { metafields: mf });
+
+    // 4) send Classic invite if not enabled
     if (state !== 'ENABLED') {
-      const inv = await gql(Q.customerSendInvite, {
-        id: node.id,
+      await gql(Q.customerSendInvite, {
+        id,
         input: {
           subject: 'Activate your AutoCounsel account',
           customMessage: 'Create your password to access your dashboard and documents.'
         }
       });
-      const invErrs = inv?.customerSendInvite?.userErrors || [];
-      if (invErrs.length) {
-        console.warn('customerSendInvite userErrors', invErrs);
-      }
     }
 
-    return res.status(200).json({ ok:true, customerId: node.id, state: node.state });
+    return res.status(200).json({ ok:true });
   } catch (e) {
     console.error('intake-upsert error:', e);
     return res.status(200).json({ ok:false, error: String(e?.message || e) });
