@@ -1,6 +1,6 @@
-// JS (ESM) – Vercel serverless function
+// Vercel Serverless Function — Intake Upsert
 // Creates/updates a Customer, writes customer metafields (namespace "retainer"),
-// uploads signature to Files, and saves a file_reference metafield at custom.retainer_signature.
+// uploads signature to Files, and saves a file_reference metafield at retainer.signature.
 // Sends the classic "Activate your account" invite if the customer is not enabled.
 
 const SHOP   = process.env.SHOPIFY_SHOP;          // e.g. 9x161v-j4.myshopify.com
@@ -46,8 +46,8 @@ const Q = {
       }
     }`,
   customerUpdate: `
-    mutation($id:ID!, $input:CustomerInput!){
-      customerUpdate(id:$id, input:$input){
+    mutation($input:CustomerInput!){
+      customerUpdate(input:$input){
         customer{ id email state }
         userErrors{ field message }
       }
@@ -84,14 +84,12 @@ const Q = {
     }`
 };
 
+// Upload signature data URL to Shopify Files
 async function uploadSignatureToFiles(dataUrl){
   if (!dataUrl || !dataUrl.startsWith('data:image/png')) return null;
-
-  // 1) decode base64
   const base64 = dataUrl.split(',')[1];
   const buf = Buffer.from(base64, 'base64');
 
-  // 2) staged upload target
   const su = await gql(Q.stagedUploadsCreate, {
     input: [{
       resource: "FILE",
@@ -103,18 +101,16 @@ async function uploadSignatureToFiles(dataUrl){
   const target = su.stagedUploadsCreate.stagedTargets?.[0];
   if (!target?.url) return null;
 
-  // 3) post to staged URL
   const form = new FormData();
   for (const p of target.parameters) form.append(p.name, p.value);
   form.append('file', new Blob([buf], { type:'image/png' }), 'signature.png');
   await fetch(target.url, { method:'POST', body: form });
 
-  // 4) create file record
   const fc = await gql(Q.fileCreate, {
     files: [{ contentType: "IMAGE", originalSource: target.resourceUrl, alt: "Retainer signature" }]
   });
   const file = fc.fileCreate.files?.[0];
-  return file?.id || null; // GraphQL ID e.g. gid://shopify/MediaImage/...
+  return file?.id || null;
 }
 
 export default async function handler(req, res) {
@@ -127,7 +123,7 @@ export default async function handler(req, res) {
     const email = String(p.email || '').trim().toLowerCase();
     if (!email) return res.status(400).json({ ok:false, error:'missing email' });
 
-    // 1) find or create/update customer
+    // === 1. find or create/update customer ===
     let id, state;
     try {
       const found = await gql(Q.customersByEmail, { q: `email:${JSON.stringify(email)}` });
@@ -162,38 +158,37 @@ export default async function handler(req, res) {
       id = created.customerCreate.customer.id;
       state = created.customerCreate.customer.state;
     } else {
-      const updated = await gql(Q.customerUpdate, { id, input: baseInput });
+      const updated = await gql(Q.customerUpdate, { input: { id, ...baseInput } });
       const errs = updated.customerUpdate.userErrors;
       if (errs?.length) return res.status(200).json({ ok:false, error:`customerUpdate userErrors: ${JSON.stringify(errs)}` });
     }
 
-    // 2) (optional) upload signature and get File ID
+    // === 2. upload signature (optional) ===
     let signatureFileId = null;
     if (p.signature_data_url) {
       try { signatureFileId = await uploadSignatureToFiles(p.signature_data_url); }
       catch(_) { /* non-blocking */ }
     }
 
-    // 3) write Customer metafields
+    // === 3. write metafields ===
     const mf = [
-      { key:'dob',                type:'date',                   value: p.dob || '' },
-      { key:'insurer',            type:'single_line_text_field', value: p.insurer || '' },
-      { key:'bi_limits',          type:'single_line_text_field', value: p.bi_limits || '' },
-      { key:'has_bi',             type:'boolean',                value: p.has_bi ? 'true' : 'false' },
-      { key:'cars_count',         type:'number_integer',         value: String(p.cars_count ?? 0) },
-      { key:'vehicles_json',      type:'json',                   value: JSON.stringify(p.vehicles || []) },
-      { key:'household_json',     type:'json',                   value: JSON.stringify(p.household || []) },
-      { key:'intake_notes',       type:'multi_line_text_field',  value: p.intake_notes || '' },
-      { key:'last_retainer_plan', type:'single_line_text_field', value: p.retainer_plan || '' },
-      { key:'last_retainer_term', type:'single_line_text_field', value: p.retainer_term || '' }
-    ].map(m => ({ ...m, namespace:'retainer', ownerId: id }));
+      { namespace:'retainer', ownerId:id, key:'dob',                type:'date',                   value: p.dob || '' },
+      { namespace:'retainer', ownerId:id, key:'insurer',            type:'single_line_text_field', value: p.insurer || '' },
+      { namespace:'retainer', ownerId:id, key:'bi_limits',          type:'single_line_text_field', value: p.bi_limits || '' },
+      { namespace:'retainer', ownerId:id, key:'has_bi',             type:'boolean',                value: p.has_bi ? 'true' : 'false' },
+      { namespace:'retainer', ownerId:id, key:'cars_count',         type:'number_integer',         value: String(p.cars_count ?? 0) },
+      { namespace:'retainer', ownerId:id, key:'vehicles_json',      type:'json',                   value: JSON.stringify(p.vehicles || []) },
+      { namespace:'retainer', ownerId:id, key:'household_json',     type:'json',                   value: JSON.stringify(p.household || []) },
+      { namespace:'retainer', ownerId:id, key:'intake_notes',       type:'multi_line_text_field',  value: p.intake_notes || '' },
+      { namespace:'retainer', ownerId:id, key:'last_retainer_plan', type:'single_line_text_field', value: p.retainer_plan || '' },
+      { namespace:'retainer', ownerId:id, key:'last_retainer_term', type:'single_line_text_field', value: p.retainer_term || '' }
+    ];
 
-    // Signature as file_reference at custom.retainer_signature
     if (signatureFileId) {
       mf.push({
-        namespace:'custom',
-        ownerId: id,
-        key:'retainer_signature',
+        namespace:'retainer',
+        ownerId:id,
+        key:'signature',
         type:'file_reference',
         value: JSON.stringify({ file_id: signatureFileId })
       });
@@ -201,7 +196,7 @@ export default async function handler(req, res) {
 
     await gql(Q.metafieldsSet, { metafields: mf });
 
-    // 4) send Classic invite if not enabled
+    // === 4. send invite if disabled ===
     if (state !== 'ENABLED') {
       await gql(Q.customerSendInvite, {
         id,
