@@ -1,11 +1,8 @@
-// Vercel Serverless Function — Intake Upsert (Shopify Admin API 2024-07)
-// - Creates/updates a Customer
-// - Writes Customer metafields under namespace "retainer"
-// - Uploads signature PNG to Files and stores file_reference at retainer.signature
-// - Sends the classic account invite via REST (since 2024-07 GraphQL has no invite mutation)
+// /api/retainer/intake-upsert.js
+// Shopify Admin API 2024-07 — create/update Customer, write retainer/* metafields, optional signature upload, REST invite.
 
-const SHOP   = process.env.SHOPIFY_SHOP;          // e.g. 9x161v-j4.myshopify.com
-const TOKEN  = process.env.SHOPIFY_ADMIN_TOKEN;   // Admin API access token
+const SHOP   = process.env.SHOPIFY_SHOP;
+const TOKEN  = process.env.SHOPIFY_ADMIN_TOKEN;
 const ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
@@ -18,8 +15,6 @@ function cors(res, origin) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
 
-function isValidPhone(s){ return /^\+?[1-9]\d{7,14}$/.test(s || ''); }
-
 async function gql(query, variables) {
   const r = await fetch(`https://${SHOP}/admin/api/2024-07/graphql.json`, {
     method: 'POST',
@@ -28,7 +23,7 @@ async function gql(query, variables) {
   });
   const j = await r.json();
   if (!r.ok || j.errors) {
-    const err = (j && j.errors) ? JSON.stringify(j.errors) : await r.text();
+    const err = j.errors ? JSON.stringify(j.errors) : await r.text();
     throw new Error(`GraphQL HTTP ${r.status} ${r.statusText}: ${err}`);
   }
   return j.data;
@@ -63,9 +58,7 @@ const Q = {
   stagedUploadsCreate: `
     mutation($input:[StagedUploadInput!]!){
       stagedUploadsCreate(input:$input){
-        stagedTargets{
-          url resourceUrl parameters{ name value }
-        }
+        stagedTargets{ url resourceUrl parameters{ name value } }
         userErrors{ field message }
       }
     }`,
@@ -78,7 +71,12 @@ const Q = {
     }`
 };
 
-// Upload signature data URL to Shopify Files → return file GraphQL ID
+// --- helpers ---
+function isValidPhone(s){ return /^\+?[1-9]\d{7,14}$/.test(s || ''); }
+function isYMD(s){ return /^\d{4}-\d{2}-\d{2}$/.test(s || ''); }
+function nonBlank(s){ return typeof s === 'string' ? s.trim() !== '' : s != null; }
+
+// Upload signature PNG to Files → returns file GID
 async function uploadSignatureToFiles(dataUrl){
   if (!dataUrl || !dataUrl.startsWith('data:image/png')) return null;
   const base64 = dataUrl.split(',')[1];
@@ -107,61 +105,35 @@ async function uploadSignatureToFiles(dataUrl){
   return file?.id || null;
 }
 
-// Send the classic account invite via REST (works on 2024-07)
+// Classic invite via REST
 async function sendInviteREST(customerGid, email){
   try {
-    // customerGid looks like gid://shopify/Customer/123456789
     const numericId = String(customerGid).split('/').pop();
     const url = `https://${SHOP}/admin/api/2024-07/customers/${numericId}/send_invite.json`;
-    const body = {
-      // subject/message are optional; Shopify will use the store’s default template if omitted
-      customer_invite: {
-        to: email || undefined
-      }
-    };
     const r = await fetch(url, {
       method: 'POST',
-      headers: {
-        'X-Shopify-Access-Token': TOKEN,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(body)
+      headers: { 'X-Shopify-Access-Token': TOKEN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customer_invite: { to: email || undefined } })
     });
-    // Non-fatal on failure; log and continue
-    if (!r.ok) {
-      const t = await r.text().catch(()=> '');
-      console.warn('send_invite REST failed', r.status, t);
-    }
-  } catch (e) {
-    console.warn('sendInviteREST error', e);
-  }
+    if (!r.ok) console.warn('send_invite failed', r.status, await r.text().catch(()=> ''));
+  } catch(e){ console.warn('sendInviteREST error', e); }
 }
 
 export default async function handler(req, res) {
   cors(res, req.headers.origin);
   if (req.method === 'OPTIONS') return res.status(204).end();
-  if (req.method !== 'POST') return res.status(405).end();
+  if (req.method !== 'POST')   return res.status(405).end();
 
   try {
     const p = req.body || {};
     const email = String(p.email || '').trim().toLowerCase();
     if (!email) return res.status(400).json({ ok:false, error:'missing email' });
 
-    // 1) Find or create/update customer
+    // 1) find or create/update customer
     let id, state;
-    try {
-      const found = await gql(Q.customersByEmail, { q: `email:${JSON.stringify(email)}` });
-      id = found.customers.nodes[0]?.id;
-      state = found.customers.nodes[0]?.state;
-    } catch (e) {
-      if (String(e).includes('ACCESS_DENIED')) {
-        return res.status(200).json({
-          ok:false,
-          error:'Shopify blocked Customer access (Protected customer data). Approve access in app settings, reinstall the app, and update the Admin token.'
-        });
-      }
-      throw e;
-    }
+    const found = await gql(Q.customersByEmail, { q: `email:${JSON.stringify(email)}` });
+    id = found.customers.nodes[0]?.id;
+    state = found.customers.nodes[0]?.state;
 
     const baseInput = {
       email,
@@ -187,27 +159,40 @@ export default async function handler(req, res) {
       if (errs?.length) return res.status(200).json({ ok:false, error:`customerUpdate userErrors: ${JSON.stringify(errs)}` });
     }
 
-    // 2) Upload signature (optional)
+    // 2) optional signature upload
     let signatureFileId = null;
     if (p.signature_data_url) {
-      try { signatureFileId = await uploadSignatureToFiles(p.signature_data_url); }
-      catch(_) { /* non-blocking */ }
+      try { signatureFileId = await uploadSignatureToFiles(p.signature_data_url); } catch(_) {}
     }
 
-    // 3) Write Customer metafields (namespace retainer)
-    const mf = [
-      { namespace:'retainer', ownerId:id, key:'dob',                type:'date',                   value: p.dob || '' },
-      { namespace:'retainer', ownerId:id, key:'insurer',            type:'single_line_text_field', value: p.insurer || '' },
-      { namespace:'retainer', ownerId:id, key:'bi_limits',          type:'single_line_text_field', value: p.bi_limits || '' },
-      { namespace:'retainer', ownerId:id, key:'has_bi',             type:'boolean',                value: p.has_bi ? 'true' : 'false' },
-      { namespace:'retainer', ownerId:id, key:'cars_count',         type:'number_integer',         value: String(p.cars_count ?? 0) },
-      { namespace:'retainer', ownerId:id, key:'vehicles_json',      type:'json',                   value: JSON.stringify(p.vehicles || []) },
-      { namespace:'retainer', ownerId:id, key:'household_json',     type:'json',                   value: JSON.stringify(p.household || []) },
-      { namespace:'retainer', ownerId:id, key:'intake_notes',       type:'multi_line_text_field',  value: p.intake_notes || '' },
-      { namespace:'retainer', ownerId:id, key:'last_retainer_plan', type:'single_line_text_field', value: p.retainer_plan || '' },
-      { namespace:'retainer', ownerId:id, key:'last_retainer_term', type:'single_line_text_field', value: p.retainer_term || '' }
-    ];
+    // 3) build metafields with blank-safe guards
+    const mf = [];
 
+    // date
+    if (nonBlank(p.dob) && isYMD(p.dob)) {
+      mf.push({ namespace:'retainer', ownerId:id, key:'dob', type:'date', value: p.dob });
+    }
+
+    // single line text
+    if (nonBlank(p.insurer))   mf.push({ namespace:'retainer', ownerId:id, key:'insurer',   type:'single_line_text_field', value: String(p.insurer) });
+    if (nonBlank(p.bi_limits)) mf.push({ namespace:'retainer', ownerId:id, key:'bi_limits', type:'single_line_text_field', value: String(p.bi_limits) });
+
+    // booleans/ints
+    mf.push({ namespace:'retainer', ownerId:id, key:'has_bi',     type:'boolean',        value: p.has_bi ? 'true' : 'false' });
+    mf.push({ namespace:'retainer', ownerId:id, key:'cars_count', type:'number_integer', value: String(p.cars_count ?? 0) });
+
+    // json
+    mf.push({ namespace:'retainer', ownerId:id, key:'vehicles_json',  type:'json', value: JSON.stringify(p.vehicles  || []) });
+    mf.push({ namespace:'retainer', ownerId:id, key:'household_json', type:'json', value: JSON.stringify(p.household || []) });
+
+    // multi-line text
+    if (nonBlank(p.intake_notes)) mf.push({ namespace:'retainer', ownerId:id, key:'intake_notes', type:'multi_line_text_field', value: String(p.intake_notes) });
+
+    // last plan/term
+    if (nonBlank(p.retainer_plan)) mf.push({ namespace:'retainer', ownerId:id, key:'last_retainer_plan', type:'single_line_text_field', value: String(p.retainer_plan) });
+    if (nonBlank(p.retainer_term)) mf.push({ namespace:'retainer', ownerId:id, key:'last_retainer_term', type:'single_line_text_field', value: String(p.retainer_term) });
+
+    // file_reference signature
     if (signatureFileId) {
       mf.push({
         namespace:'retainer',
@@ -218,14 +203,21 @@ export default async function handler(req, res) {
       });
     }
 
-    await gql(Q.metafieldsSet, { metafields: mf });
-
-    // 4) Send classic account invite if not enabled (REST)
-    if (state !== 'ENABLED') {
-      await sendInviteREST(id, email);
+    // 4) write metafields (and expose any userErrors)
+    let wrote = [];
+    if (mf.length) {
+      const result = await gql(Q.metafieldsSet, { metafields: mf });
+      const errs = result.metafieldsSet.userErrors || [];
+      if (errs.length) {
+        return res.status(200).json({ ok:false, error:`metafieldsSet userErrors: ${JSON.stringify(errs)}` });
+      }
+      wrote = (result.metafieldsSet.metafields || []).map(m => `${m.namespace}.${m.key}`);
     }
 
-    return res.status(200).json({ ok:true });
+    // 5) send classic invite if needed (non-blocking)
+    if (state !== 'ENABLED') { sendInviteREST(id, email).catch(()=>{}); }
+
+    return res.status(200).json({ ok:true, wrote });
   } catch (e) {
     console.error('intake-upsert error:', e);
     return res.status(200).json({ ok:false, error: String(e?.message || e) });
