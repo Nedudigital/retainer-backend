@@ -6,11 +6,25 @@ const ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth:{ persistSession:false } });
 
-function cors(res, origin){
-  if (origin && ORIGINS.includes(origin)) { res.setHeader('Access-Control-Allow-Origin', origin); res.setHeader('Vary','Origin'); }
-  res.setHeader('Access-Control-Allow-Methods','GET, PUT, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers','Content-Type');
-}
+function cors(res, origin) {
+    const allowList = (process.env.ALLOWED_ORIGINS || '')
+      .split(',').map(s => s.trim()).filter(Boolean);
+  
+    // allow if in list; otherwise mirror origin if present (no credentials used)
+    const allow = origin && (allowList.length === 0 || allowList.includes(origin));
+  
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Max-Age', '86400');
+    if (origin && allow) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+    } else if (!origin) {
+      // server-to-server or curl — safest default
+      res.setHeader('Access-Control-Allow-Origin', '*');
+    }
+  }
+  
 
 function keyPath(email){ const safe=email.toLowerCase().replace(/[^a-z0-9._-]+/g,'-'); return `signatures/${safe}/${Date.now()}.png`; }
 
