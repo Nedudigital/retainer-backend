@@ -1,11 +1,13 @@
+// /api/retainer/intake-upsert.js
 // Shopify Admin API 2024-07 — Create/Update Customer, write retainer/* metafields,
 // optional signature upload, REST invite (classic), with read-back + strict guards.
 
-const SHOP   = process.env.SHOPIFY_SHOP;        // e.g. 9x161v-j4.myshopify.com
+const SHOP   = process.env.SHOPIFY_SHOP;        // e.g. my-store.myshopify.com
 const TOKEN  = process.env.SHOPIFY_ADMIN_TOKEN; // Admin API access token
 const ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
+// ---------- CORS ----------
 function cors(res, origin) {
   if (origin && ORIGINS.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
@@ -15,6 +17,7 @@ function cors(res, origin) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
 
+// ---------- GraphQL helper ----------
 async function gql(query, variables) {
   const r = await fetch(`https://${SHOP}/admin/api/2024-07/graphql.json`, {
     method: 'POST',
@@ -29,7 +32,7 @@ async function gql(query, variables) {
   return j.data;
 }
 
-// ---------- GQL ----------
+// ---------- Queries/Mutations ----------
 const Q = {
   customersByEmail: `
     query($q:String!){
@@ -70,7 +73,7 @@ const Q = {
         userErrors{ field message }
       }
     }`,
-  // Read-back
+  // Read-back of saved metafields on the customer
   customerView: `
     query($id:ID!){
       customer(id:$id){
@@ -81,11 +84,16 @@ const Q = {
         }
       }
     }`,
-  // Optional: confirm definitions exist on the Customer resource (debug)
+  // Definitions (debug). NOTE: type is an OBJECT here → must select a subfield.
   defs: `
     query{
       metafieldDefinitions(first:50, ownerType:CUSTOMER, namespace:"retainer"){
-        nodes{ name namespace key type }
+        nodes{
+          name
+          namespace
+          key
+          type { name }   # <- critical: select subfield on MetafieldDefinitionType
+        }
       }
     }`
 };
@@ -95,12 +103,13 @@ function isValidPhone(s){ return /^\+?[1-9]\d{7,14}$/.test(s || ''); }
 function isYMD(s){ return /^\d{4}-\d{2}-\d{2}$/.test(s || ''); }
 function nonBlank(s){ return typeof s === 'string' ? s.trim() !== '' : s != null; }
 
-// Upload signature PNG to Files → returns file GID
+// Upload signature PNG (data URL) to Shopify Files → returns file GID
 async function uploadSignatureToFiles(dataUrl){
   if (!dataUrl || !dataUrl.startsWith('data:image/png')) return null;
   const base64 = dataUrl.split(',')[1];
   const buf = Buffer.from(base64, 'base64');
 
+  // 1) get staged upload target
   const su = await gql(Q.stagedUploadsCreate, {
     input: [{
       resource: "FILE",
@@ -112,11 +121,13 @@ async function uploadSignatureToFiles(dataUrl){
   const target = su.stagedUploadsCreate.stagedTargets?.[0];
   if (!target?.url) return null;
 
+  // 2) POST to staged URL
   const form = new FormData();
   for (const p of target.parameters) form.append(p.name, p.value);
   form.append('file', new Blob([buf], { type:'image/png' }), 'signature.png');
   await fetch(target.url, { method:'POST', body: form });
 
+  // 3) create file record
   const fc = await gql(Q.fileCreate, {
     files: [{ contentType: "IMAGE", originalSource: target.resourceUrl, alt: "Retainer signature" }]
   });
@@ -124,7 +135,7 @@ async function uploadSignatureToFiles(dataUrl){
   return file?.id || null;
 }
 
-// Classic invite via REST (non-blocking)
+// Classic account invite via REST (2024-07 has no GraphQL invite mutation)
 async function sendInviteREST(customerGid, email){
   try {
     const numericId = String(customerGid).split('/').pop();
@@ -150,9 +161,20 @@ export default async function handler(req, res) {
     if (!email) return res.status(400).json({ ok:false, error:'missing email' });
 
     // 1) Find or create/update customer
-    const found = await gql(Q.customersByEmail, { q: `email:${JSON.stringify(email)}` });
-    let id   = found.customers.nodes[0]?.id;
-    let state= found.customers.nodes[0]?.state;
+    let id, state;
+    try {
+      const found = await gql(Q.customersByEmail, { q: `email:${JSON.stringify(email)}` });
+      id = found.customers.nodes[0]?.id;
+      state = found.customers.nodes[0]?.state;
+    } catch (e) {
+      if (String(e).includes('ACCESS_DENIED')) {
+        return res.status(200).json({
+          ok:false,
+          error:'Shopify blocked Customer access (Protected customer data). Approve access in app settings, reinstall the app, and update the Admin token.'
+        });
+      }
+      throw e;
+    }
 
     const baseInput = {
       email,
@@ -170,7 +192,7 @@ export default async function handler(req, res) {
       const created = await gql(Q.customerCreate, { input: baseInput });
       const errs = created.customerCreate.userErrors;
       if (errs?.length) return res.status(200).json({ ok:false, error:`customerCreate userErrors: ${JSON.stringify(errs)}` });
-      id    = created.customerCreate.customer.id;
+      id = created.customerCreate.customer.id;
       state = created.customerCreate.customer.state;
     } else {
       const updated = await gql(Q.customerUpdate, { input: { id, ...baseInput } });
@@ -184,13 +206,12 @@ export default async function handler(req, res) {
       try { signatureFileId = await uploadSignatureToFiles(p.signature_data_url); } catch(_) {}
     }
 
-    // 3) Build metafields (blank-safe)
+    // 3) Build metafields with blank-safe guards
     const mf = [];
 
     if (nonBlank(p.dob) && isYMD(p.dob)) {
       mf.push({ namespace:'retainer', ownerId:id, key:'dob', type:'date', value: p.dob });
     }
-
     if (nonBlank(p.insurer))   mf.push({ namespace:'retainer', ownerId:id, key:'insurer',   type:'single_line_text_field', value: String(p.insurer) });
     if (nonBlank(p.bi_limits)) mf.push({ namespace:'retainer', ownerId:id, key:'bi_limits', type:'single_line_text_field', value: String(p.bi_limits) });
 
@@ -203,7 +224,6 @@ export default async function handler(req, res) {
     if (nonBlank(p.intake_notes)) {
       mf.push({ namespace:'retainer', ownerId:id, key:'intake_notes', type:'multi_line_text_field', value: String(p.intake_notes) });
     }
-
     if (nonBlank(p.retainer_plan)) mf.push({ namespace:'retainer', ownerId:id, key:'last_retainer_plan', type:'single_line_text_field', value: String(p.retainer_plan) });
     if (nonBlank(p.retainer_term)) mf.push({ namespace:'retainer', ownerId:id, key:'last_retainer_term', type:'single_line_text_field', value: String(p.retainer_term) });
 
@@ -217,7 +237,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // 4) Write metafields
+    // 4) Write metafields (surface any userErrors)
     let wrote = [];
     if (mf.length) {
       const result = await gql(Q.metafieldsSet, { metafields: mf });
@@ -228,12 +248,18 @@ export default async function handler(req, res) {
       wrote = (result.metafieldsSet.metafields || []).map(m => `${m.namespace}.${m.key}`);
     }
 
-    // 5) Invite if disabled (fire & forget)
+    // 5) Send classic invite if disabled (non-blocking)
     if (state !== 'ENABLED') { sendInviteREST(id, email).catch(()=>{}); }
 
-    // 6) Read back to prove it landed
+    // 6) Read back to prove it landed; never fail overall if defs read has an issue
     const view = await gql(Q.customerView, { id });
-    const defs = await gql(Q.defs, {});
+    let defsNodes = [];
+    try {
+      const defs = await gql(Q.defs, {});
+      defsNodes = defs.metafieldDefinitions?.nodes || [];
+    } catch (e) {
+      console.warn('defs query skipped:', String(e?.message || e));
+    }
 
     return res.status(200).json({
       ok: true,
@@ -241,7 +267,7 @@ export default async function handler(req, res) {
       customer_id: id,
       customer_email: view.customer?.email || email,
       metafields: view.customer?.metafields?.nodes || [],
-      definitions: defs.metafieldDefinitions?.nodes || []
+      definitions: defsNodes
     });
   } catch (e) {
     console.error('intake-upsert error:', e);
