@@ -1,6 +1,6 @@
 // /api/retainer/intake-upsert.js
 // Shopify Admin API 2024-07 — Create/Update Customer, write retainer/* metafields,
-// optional signature upload, REST invite (classic), with read-back + strict guards.
+// optional signature upload (Files), REST invite (classic), read-back, and full error surfacing.
 
 const SHOP   = process.env.SHOPIFY_SHOP;        // e.g. my-store.myshopify.com
 const TOKEN  = process.env.SHOPIFY_ADMIN_TOKEN; // Admin API access token
@@ -73,7 +73,6 @@ const Q = {
         userErrors{ field message }
       }
     }`,
-  // Read-back of saved metafields on the customer
   customerView: `
     query($id:ID!){
       customer(id:$id){
@@ -84,7 +83,6 @@ const Q = {
         }
       }
     }`,
-  // Definitions (debug). NOTE: type is an OBJECT here → must select a subfield.
   defs: `
     query{
       metafieldDefinitions(first:50, ownerType:CUSTOMER, namespace:"retainer"){
@@ -92,7 +90,7 @@ const Q = {
           name
           namespace
           key
-          type { name }   # <- critical: select subfield on MetafieldDefinitionType
+          type { name }   # MetafieldDefinitionType is an object — select a subfield
         }
       }
     }`
@@ -103,9 +101,12 @@ function isValidPhone(s){ return /^\+?[1-9]\d{7,14}$/.test(s || ''); }
 function isYMD(s){ return /^\d{4}-\d{2}-\d{2}$/.test(s || ''); }
 function nonBlank(s){ return typeof s === 'string' ? s.trim() !== '' : s != null; }
 
-// Upload signature PNG (data URL) to Shopify Files → returns file GID
+// Upload signature PNG (data URL) to Shopify Files → returns { fileId, error }
 async function uploadSignatureToFiles(dataUrl){
-  if (!dataUrl || !dataUrl.startsWith('data:image/png')) return null;
+  if (!dataUrl || !dataUrl.startsWith('data:image/png')) {
+    return { fileId:null, error:'signature_data_url missing/invalid' };
+  }
+
   const base64 = dataUrl.split(',')[1];
   const buf = Buffer.from(base64, 'base64');
 
@@ -118,21 +119,32 @@ async function uploadSignatureToFiles(dataUrl){
       httpMethod: "POST"
     }]
   });
-  const target = su.stagedUploadsCreate.stagedTargets?.[0];
-  if (!target?.url) return null;
+  const suErrs = su.stagedUploadsCreate?.userErrors || [];
+  if (suErrs.length) return { fileId:null, error:'stagedUploadsCreate: ' + JSON.stringify(suErrs) };
 
-  // 2) POST to staged URL
+  const target = su.stagedUploadsCreate.stagedTargets?.[0];
+  if (!target?.url) return { fileId:null, error:'stagedUploadsCreate returned no target.url' };
+
+  // 2) POST binary to staged URL
   const form = new FormData();
   for (const p of target.parameters) form.append(p.name, p.value);
   form.append('file', new Blob([buf], { type:'image/png' }), 'signature.png');
-  await fetch(target.url, { method:'POST', body: form });
+  const uploadRes = await fetch(target.url, { method:'POST', body: form });
+  if (!uploadRes.ok) {
+    const t = await uploadRes.text().catch(()=> '');
+    return { fileId:null, error:`staged upload HTTP ${uploadRes.status}: ${t}` };
+  }
 
   // 3) create file record
   const fc = await gql(Q.fileCreate, {
     files: [{ contentType: "IMAGE", originalSource: target.resourceUrl, alt: "Retainer signature" }]
   });
-  const file = fc.fileCreate.files?.[0];
-  return file?.id || null;
+  const fcErrs = fc.fileCreate?.userErrors || [];
+  if (fcErrs.length) return { fileId:null, error:'fileCreate: ' + JSON.stringify(fcErrs) };
+
+  const fileId = fc.fileCreate.files?.[0]?.id || null;
+  if (!fileId) return { fileId:null, error:'fileCreate returned no file id' };
+  return { fileId, error:null };
 }
 
 // Classic account invite via REST (2024-07 has no GraphQL invite mutation)
@@ -200,13 +212,20 @@ export default async function handler(req, res) {
       if (errs?.length) return res.status(200).json({ ok:false, error:`customerUpdate userErrors: ${JSON.stringify(errs)}` });
     }
 
-    // 2) Optional signature upload
+    // 2) Optional signature upload (with debug)
     let signatureFileId = null;
+    let sigDebug = { attempted: !!p.signature_data_url, uploaded:false, file_id:null, error:null };
     if (p.signature_data_url) {
-      try { signatureFileId = await uploadSignatureToFiles(p.signature_data_url); } catch(_) {}
+      try {
+        const { fileId, error } = await uploadSignatureToFiles(p.signature_data_url);
+        signatureFileId = fileId;
+        sigDebug = { attempted:true, uploaded: !!fileId, file_id: fileId || null, error: error || null };
+      } catch (e) {
+        sigDebug = { attempted:true, uploaded:false, file_id:null, error: String(e?.message || e) };
+      }
     }
 
-    // 3) Build metafields with blank-safe guards
+    // 3) Build metafields (blank-safe for text/date)
     const mf = [];
 
     if (nonBlank(p.dob) && isYMD(p.dob)) {
@@ -243,7 +262,7 @@ export default async function handler(req, res) {
       const result = await gql(Q.metafieldsSet, { metafields: mf });
       const errs = result.metafieldsSet.userErrors || [];
       if (errs.length) {
-        return res.status(200).json({ ok:false, error:`metafieldsSet userErrors: ${JSON.stringify(errs)}`, attempted: mf });
+        return res.status(200).json({ ok:false, error:`metafieldsSet userErrors: ${JSON.stringify(errs)}`, attempted: mf, sig: sigDebug });
       }
       wrote = (result.metafieldsSet.metafields || []).map(m => `${m.namespace}.${m.key}`);
     }
@@ -251,7 +270,7 @@ export default async function handler(req, res) {
     // 5) Send classic invite if disabled (non-blocking)
     if (state !== 'ENABLED') { sendInviteREST(id, email).catch(()=>{}); }
 
-    // 6) Read back to prove it landed; never fail overall if defs read has an issue
+    // 6) Read back; don't fail overall if defs read has an issue
     const view = await gql(Q.customerView, { id });
     let defsNodes = [];
     try {
@@ -267,7 +286,8 @@ export default async function handler(req, res) {
       customer_id: id,
       customer_email: view.customer?.email || email,
       metafields: view.customer?.metafields?.nodes || [],
-      definitions: defsNodes
+      definitions: defsNodes,
+      sig: sigDebug
     });
   } catch (e) {
     console.error('intake-upsert error:', e);
