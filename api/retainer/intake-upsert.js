@@ -1,10 +1,9 @@
-// Vercel Serverless Function — Intake Upsert
-// Creates/updates a Customer, writes customer metafields (namespace "retainer"),
-// uploads signature to Files, and saves a file_reference metafield at retainer.signature.
-// Sends the classic "Activate your account" invite if the customer is not enabled.
+// Vercel Serverless Function — Intake Upsert (Final)
+// Creates/updates Customer, writes metafields (namespace "retainer"),
+// uploads signature to Files, and stores file_reference at retainer.signature.
 
-const SHOP   = process.env.SHOPIFY_SHOP;          // e.g. 9x161v-j4.myshopify.com
-const TOKEN  = process.env.SHOPIFY_ADMIN_TOKEN;   // Admin API token
+const SHOP   = process.env.SHOPIFY_SHOP;
+const TOKEN  = process.env.SHOPIFY_ADMIN_TOKEN;
 const ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
@@ -17,17 +16,18 @@ function cors(res, origin) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
 
-function isValidPhone(s){ return /^\+?[1-9]\d{7,14}$/.test(s || ''); }
-
 async function gql(query, variables) {
   const r = await fetch(`https://${SHOP}/admin/api/2024-07/graphql.json`, {
     method: 'POST',
-    headers: { 'X-Shopify-Access-Token': TOKEN, 'Content-Type': 'application/json' },
+    headers: {
+      'X-Shopify-Access-Token': TOKEN,
+      'Content-Type': 'application/json'
+    },
     body: JSON.stringify({ query, variables })
   });
   const j = await r.json();
   if (!r.ok || j.errors) {
-    const err = (j && j.errors) ? JSON.stringify(j.errors) : await r.text();
+    const err = j.errors ? JSON.stringify(j.errors) : await r.text();
     throw new Error(`GraphQL HTTP ${r.status} ${r.statusText}: ${err}`);
   }
   return j.data;
@@ -52,13 +52,6 @@ const Q = {
         userErrors{ field message }
       }
     }`,
-  customerSendInvite: `
-    mutation($id:ID!, $input:CustomerInviteInput!){
-      customerSendInvite(id:$id, input:$input){
-        customerInvite{ to }
-        userErrors{ field message }
-      }
-    }`,
   metafieldsSet: `
     mutation($metafields:[MetafieldsSetInput!]!){
       metafieldsSet(metafields:$metafields){
@@ -69,9 +62,7 @@ const Q = {
   stagedUploadsCreate: `
     mutation($input:[StagedUploadInput!]!){
       stagedUploadsCreate(input:$input){
-        stagedTargets{
-          url resourceUrl parameters{ name value }
-        }
+        stagedTargets{ url resourceUrl parameters{ name value } }
         userErrors{ field message }
       }
     }`,
@@ -84,7 +75,7 @@ const Q = {
     }`
 };
 
-// Upload signature data URL to Shopify Files
+// === Upload signature PNG to Shopify Files ===
 async function uploadSignatureToFiles(dataUrl){
   if (!dataUrl || !dataUrl.startsWith('data:image/png')) return null;
   const base64 = dataUrl.split(',')[1];
@@ -125,25 +116,15 @@ export default async function handler(req, res) {
 
     // === 1. find or create/update customer ===
     let id, state;
-    try {
-      const found = await gql(Q.customersByEmail, { q: `email:${JSON.stringify(email)}` });
-      id = found.customers.nodes[0]?.id;
-      state = found.customers.nodes[0]?.state;
-    } catch (e) {
-      if (String(e).includes('ACCESS_DENIED')) {
-        return res.status(200).json({
-          ok:false,
-          error:'Shopify blocked Customer access (Protected customer data). Approve access in app settings, reinstall the app, and update the Admin token.'
-        });
-      }
-      throw e;
-    }
+    const found = await gql(Q.customersByEmail, { q: `email:${JSON.stringify(email)}` });
+    id = found.customers.nodes[0]?.id;
+    state = found.customers.nodes[0]?.state;
 
     const baseInput = {
       email,
       firstName: p.first_name || undefined,
       lastName:  p.last_name  || undefined,
-      phone:     isValidPhone(p.phone) ? p.phone : undefined,
+      phone:     p.phone || undefined,
       addresses: p.home_address ? [{
         address1: p.home_address,
         firstName: p.first_name || undefined,
@@ -194,18 +175,9 @@ export default async function handler(req, res) {
       });
     }
 
-    await gql(Q.metafieldsSet, { metafields: mf });
-
-    // === 4. send invite if disabled ===
-    if (state !== 'ENABLED') {
-      await gql(Q.customerSendInvite, {
-        id,
-        input: {
-          subject: 'Activate your AutoCounsel account',
-          customMessage: 'Create your password to access your dashboard and documents.'
-        }
-      });
-    }
+    const setRes = await gql(Q.metafieldsSet, { metafields: mf });
+    const mfErrs = setRes.metafieldsSet.userErrors;
+    if (mfErrs?.length) return res.status(200).json({ ok:false, error:`metafieldsSet userErrors: ${JSON.stringify(mfErrs)}` });
 
     return res.status(200).json({ ok:true });
   } catch (e) {
