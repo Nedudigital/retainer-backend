@@ -1,7 +1,6 @@
-// /api/retainer/order-webhook.js
+// api/retainer/order-webhook.js
 // HMAC-verified Shopify webhook for orders/create & orders/paid.
 // Writes order metafields under namespace "retainer" matching your definitions.
-// Removed all bi_limits handling to match UI/backend.
 
 import crypto from 'node:crypto';
 
@@ -108,15 +107,16 @@ export default async function handler(req, res){
     const sDate  = props.signed_date   || attrs.retainer_signed_date || '';
     const hasBI  = (props.intake_has_bi === 'yes') || (props.has_bi === 'true') || (attrs.retainer_has_bi === 'yes');
     const insurer= props.intake_insurer || props.insurer || '';
+    const biLim  = props.intake_bi_limits || props.bi_limits || '';
     const dob    = props.intake_dob || props.dob || '';
     const cars   = props.intake_cars_count ?? props.cars_count ?? null;
     const notes  = props.intake_notes || '';
 
-    // JSON blobs coming from checkout
+    // JSON blobs coming from checkout (line-item props added by the flow)
     let houseJson = props.intake_household_json || '[]';
     let vehJson   = props.intake_vehicles_json  || '[]';
 
-    // Build pretty SINGLE-LINE strings (joined with " | ")
+    // Build pretty SINGLE-LINE strings (your defs are single_line_text_field)
     const toPrettyHouse = (arr) => (arr||[]).map(h=>[h.name,h.dob,h.relationship].filter(Boolean).join(' — ')).filter(Boolean).join(' | ');
     const toPrettyVeh   = (arr) => (arr||[]).map(v=>[v.year,v.make,v.model].filter(Boolean).join(' ')).filter(Boolean).join(' | ');
 
@@ -128,7 +128,8 @@ export default async function handler(req, res){
     // core
     pushSL(mfs, orderGid, 'plan', plan);
     pushSL(mfs, orderGid, 'term', term);
-    pushBL(mfs, orderGid, 'bi_info', hasBI);               // boolean (BI info)
+    pushBL(mfs, orderGid, 'bi_info', hasBI);               // boolean (Bi info)
+    pushSL(mfs, orderGid, 'bi_limits', biLim);
     pushSL(mfs, orderGid, 'insurer', insurer);
     pushNI(mfs, orderGid, 'cars_count', cars);
     pushDT(mfs, orderGid, 'dob', dob);
