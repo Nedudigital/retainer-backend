@@ -15,6 +15,7 @@ const SF_TOK  = process.env.STOREFRONT_TOKEN;
 const ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',').map(s=>s.trim()).filter(Boolean);
 
+/* ---------- CORS ---------- */
 function cors(res, origin){
   if (origin && ORIGINS.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
@@ -24,6 +25,7 @@ function cors(res, origin){
   res.setHeader('Access-Control-Allow-Headers','Content-Type');
 }
 
+/* ---------- GraphQL helpers ---------- */
 async function gqlAdmin(q, v){
   const r = await fetch(`https://${SHOP}/admin/api/2024-07/graphql.json`, {
     method:'POST',
@@ -55,24 +57,24 @@ async function gqlSF(q, v){
   return j.data;
 }
 
+/* ---------- Queries ---------- */
 const Q = {
-  // Admin
   customersByEmail: `query($q:String!){
     customers(first:1, query:$q){ nodes{ id email state } }
   }`,
-  customerUpdate:   `mutation($input:CustomerInput!){
+  customerUpdate: `mutation($input:CustomerInput!){
     customerUpdate(input:$input){
       customer{ id email state }
       userErrors{ field message }
     }
   }`,
-  customerCreate:   `mutation($input:CustomerInput!){
+  customerCreate: `mutation($input:CustomerInput!){
     customerCreate(input:$input){
       customer{ id email state }
       userErrors{ field message }
     }
   }`,
-  metafieldsSet:    `mutation($metafields:[MetafieldsSetInput!]!){
+  metafieldsSet: `mutation($metafields:[MetafieldsSetInput!]!){
     metafieldsSet(metafields:$metafields){
       metafields{ namespace key type }
       userErrors{ field message }
@@ -84,7 +86,6 @@ const Q = {
       userErrors{ field message }
     }
   }`,
-  // IMPORTANT: File is a union (MediaImage | Video | GenericFile). Read URL via type fragments.
   fileCreate: `mutation($files:[FileCreateInput!]!){
     fileCreate(files:$files){
       files{
@@ -107,14 +108,60 @@ const SF = {
   }`
 };
 
-// validators
-const isEmail=s=>/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(s||'').toLowerCase());
+/* ---------- Validators ---------- */
+const isEmail = s => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(s||'').toLowerCase());
 // loose phone check: keep digits/+ and require at least 10 characters
 const isPhoneLoose = s => String(s||'').replace(/[^\d+]/g,'').length >= 10;
 const isYMD = s => /^\d{4}-\d{2}-\d{2}$/.test(String(s||''));
-const nonBlank=s=>typeof s==='string'? s.trim()!=='' : s!=null;
+const nonBlank = s => typeof s==='string' ? s.trim()!=='' : s!=null;
 
-// DataURL → Shopify Files (IMAGE or FILE) → {fileId,fileUrl,error}
+/* ---------- Error → plain-English ---------- */
+function toPlainError(err){
+  const s = String(err || '');
+
+  // Pull Shopify userErrors JSON we included in messages
+  const mCU = s.match(/customerUpdate:\s*(\[.*\])$/);
+  const mCC = s.match(/customerCreate\(Storefront\):\s*(\[.*\])$/);
+  const mMF = s.match(/metafieldsSet:\s*(\[.*\])$/);
+  const raw = mCU?.[1] || mCC?.[1] || mMF?.[1];
+
+  if (raw){
+    try{
+      const arr = JSON.parse(raw);
+      const msgs = [];
+      for (const e of arr){
+        const field = (e?.field || []).join('.');
+        let msg = e?.message || '';
+
+        // Friendly rewrites for common fields
+        if (/phone/i.test(field) || /phone/i.test(msg)) {
+          msg = 'Phone number is invalid. Use a 10-digit US number.';
+        } else if (/email/i.test(field) || /email/i.test(msg)) {
+          msg = 'Email address is invalid.';
+        } else if (/password/i.test(field) || /password/i.test(msg)) {
+          msg = 'Password is invalid.';
+        }
+
+        if (msg && !msgs.includes(msg)) msgs.push(msg);
+      }
+      if (msgs.length) return { error: msgs.join(' '), technical: s };
+    }catch(_){}
+  }
+
+  // Known strings from this route
+  if (s.includes('invalid or missing phone')) return { error:'Phone number is required and must have at least 10 digits.', technical:s };
+  if (s.includes('invalid or missing email')) return { error:'Email address is required and must be valid.', technical:s };
+  if (s.includes('missing password'))         return { error:'A password is required to create your account.', technical:s };
+  if (s.includes('Storefront token not configured')) return { error:'Storefront API access is not configured.', technical:s };
+  if (s.includes('ACCESS_DENIED'))            return { error:'App permissions are missing in Shopify (protected customer data).', technical:s };
+  if (s.includes('customer not visible in Admin after creation')) return { error:'Customer was created but not yet visible in Admin. Please try again.', technical:s };
+
+  // Generic fallback
+  return { error: s || 'Unknown error', technical: s };
+}
+
+/* ---------- DataURL → Shopify Files ---------- */
+// Returns {fileId,fileUrl,error}
 async function uploadDataUrlToFiles(dataUrl, alt='Upload'){
   if (!dataUrl || !dataUrl.startsWith('data:')) return { fileId:null, fileUrl:null, error:'invalid data url' };
   const [meta, b64] = dataUrl.split(',');
@@ -153,6 +200,7 @@ async function uploadDataUrlToFiles(dataUrl, alt='Upload'){
   return { fileId, fileUrl, error:null };
 }
 
+/* ---------- Handler ---------- */
 export default async function handler(req,res){
   cors(res, req.headers.origin);
   if (req.method==='OPTIONS') return res.status(204).end();
@@ -161,12 +209,18 @@ export default async function handler(req,res){
   try{
     const p = req.body || {};
     const email = String(p.email||'').trim().toLowerCase();
-    if (!isEmail(email)) return res.status(400).json({ ok:false, error:'invalid or missing email' });
+    if (!isEmail(email)) {
+      const plain = toPlainError('invalid or missing email');
+      return res.status(400).json({ ok:false, ...plain });
+    }
 
     const first = (p.first_name||'').toString().trim();
     const last  = (p.last_name||'').toString().trim();
     const phoneRaw = (p.phone||'').toString().trim();
-    if (!isPhoneLoose(phoneRaw)) return res.status(400).json({ ok:false, error:'invalid or missing phone' });
+    if (!isPhoneLoose(phoneRaw)) {
+      const plain = toPlainError('invalid or missing phone');
+      return res.status(400).json({ ok:false, ...plain });
+    }
 
     // 1) Find existing customer by email
     let id, state;
@@ -176,7 +230,7 @@ export default async function handler(req,res){
       state = found.customers.nodes[0]?.state;
     }catch(e){
       if (String(e).includes('ACCESS_DENIED')) {
-        return res.status(200).json({ ok:false, error:'App lacks Protected customer data. Approve the scope in your app.' });
+        return res.status(200).json({ ok:false, ...toPlainError('ACCESS_DENIED') });
       }
       throw e;
     }
@@ -197,16 +251,17 @@ export default async function handler(req,res){
     if (!id){
       // Create passworded customer via **Storefront** (no invite/activation)
       const password = (p.password||'').toString().trim();
-      if (!password) return res.status(400).json({ ok:false, error:'missing password' });
+      if (!password) return res.status(400).json({ ok:false, ...toPlainError('missing password') });
 
-      if (!SF_TOK) return res.status(500).json({ ok:false, error:'Storefront token not configured' });
+      if (!SF_TOK) return res.status(500).json({ ok:false, ...toPlainError('Storefront token not configured') });
 
       const crSF = await gqlSF(SF.customerCreate, {
         input: { email, password, firstName:first||undefined, lastName:last||undefined }
       });
       const sfErrs = crSF.customerCreate?.userErrors || [];
       if (sfErrs.length){
-        return res.status(200).json({ ok:false, error:`customerCreate(Storefront): ${JSON.stringify(sfErrs)}` });
+        const plain = toPlainError(`customerCreate(Storefront): ${JSON.stringify(sfErrs)}`);
+        return res.status(200).json({ ok:false, ...plain });
       }
 
       // Fetch Admin ID then update Admin-side details (phone/address)
@@ -214,16 +269,22 @@ export default async function handler(req,res){
       id = found2.customers.nodes[0]?.id;
       state = found2.customers.nodes[0]?.state;
 
-      if (!id) return res.status(200).json({ ok:false, error:'customer not visible in Admin after creation' });
+      if (!id) return res.status(200).json({ ok:false, ...toPlainError('customer not visible in Admin after creation') });
 
       const up = await gqlAdmin(Q.customerUpdate, { input: { id, ...baseInput } });
       const errs = up.customerUpdate.userErrors;
-      if (errs?.length) return res.status(200).json({ ok:false, error:`customerUpdate: ${JSON.stringify(errs)}` });
+      if (errs?.length){
+        const plain = toPlainError(`customerUpdate: ${JSON.stringify(errs)}`);
+        return res.status(200).json({ ok:false, ...plain });
+      }
     } else {
       // Existing customer (cannot set/change password via Admin)
       const up = await gqlAdmin(Q.customerUpdate, { input: { id, ...baseInput } });
       const errs = up.customerUpdate.userErrors;
-      if (errs?.length) return res.status(200).json({ ok:false, error:`customerUpdate: ${JSON.stringify(errs)}` });
+      if (errs?.length){
+        const plain = toPlainError(`customerUpdate: ${JSON.stringify(errs)}`);
+        return res.status(200).json({ ok:false, ...plain });
+      }
     }
 
     // 2) Uploads (signature + optional license + insurance card)
@@ -276,13 +337,17 @@ export default async function handler(req,res){
     if (mf.length){
       const result = await gqlAdmin(Q.metafieldsSet, { metafields: mf });
       const errs = result.metafieldsSet.userErrors||[];
-      if (errs.length) return res.status(200).json({ ok:false, error:`metafieldsSet: ${JSON.stringify(errs)}` });
+      if (errs.length){
+        const plain = toPlainError(`metafieldsSet: ${JSON.stringify(errs)}`);
+        return res.status(200).json({ ok:false, ...plain });
+      }
     }
 
     // No invite emails — account already created via Storefront
     return res.status(200).json({ ok:true, customer_id:id, customer_email:email });
   }catch(e){
     console.error('intake-upsert error', e);
-    return res.status(200).json({ ok:false, error:String(e?.message||e) });
+    const plain = toPlainError(String(e?.message||e));
+    return res.status(200).json({ ok:false, ...plain });
   }
 }
