@@ -2,12 +2,7 @@
 // Upsert Customer (with password via Storefront), upload signature & docs to Shopify Files,
 // write retainer/* metafields. No JSON arrays for Household/Vehicles (pretty list only).
 // Phone is required (loose validation). BI limits removed everywhere. No invite email.
-
-// ENV:
-// SHOPIFY_SHOP=yourstore.myshopify.com
-// SHOPIFY_ADMIN_TOKEN=shpat_xxx  (Admin API)
-// STOREFRONT_TOKEN=xxxx          (Storefront API)
-// ALLOWED_ORIGINS=https://autocounsel.law,https://yourdomain.com
+// Errors are returned in plain English via { ok:false, error:"..." }.
 
 const SHOP    = process.env.SHOPIFY_SHOP;
 const ADMIN   = process.env.SHOPIFY_ADMIN_TOKEN;
@@ -130,34 +125,57 @@ function toPlainError(err){
       const arr = JSON.parse(raw);
       const msgs = [];
       for (const e of arr){
-        const field = (e?.field || []).join('.');
+        const field = (e?.field || []).join('.').toLowerCase();
         let msg = e?.message || '';
 
         // Friendly rewrites for common fields
-        if (/phone/i.test(field) || /phone/i.test(msg)) {
-          msg = 'Phone number is invalid. Use a 10-digit US number.';
-        } else if (/email/i.test(field) || /email/i.test(msg)) {
-          msg = 'Email address is invalid.';
-        } else if (/password/i.test(field) || /password/i.test(msg)) {
-          msg = 'Password is invalid.';
+        if (field.includes('phone') || /phone/i.test(msg)) {
+          msg = 'Phone number looks invalid. Please enter a 10-digit US number.';
+        } else if (field.includes('email') || /email/i.test(msg)) {
+          msg = 'Email address looks invalid.';
+        } else if (field.includes('password') || /password/i.test(msg)) {
+          msg = 'Password doesn’t meet requirements.';
         }
 
         if (msg && !msgs.includes(msg)) msgs.push(msg);
       }
-      if (msgs.length) return { error: msgs.join(' '), technical: s };
+      if (msgs.length) return { error: msgs.join(' ') };
     }catch(_){}
   }
 
   // Known strings from this route
-  if (s.includes('invalid or missing phone')) return { error:'Phone number is required and must have at least 10 digits.', technical:s };
-  if (s.includes('invalid or missing email')) return { error:'Email address is required and must be valid.', technical:s };
-  if (s.includes('missing password'))         return { error:'A password is required to create your account.', technical:s };
-  if (s.includes('Storefront token not configured')) return { error:'Storefront API access is not configured.', technical:s };
-  if (s.includes('ACCESS_DENIED'))            return { error:'App permissions are missing in Shopify (protected customer data).', technical:s };
-  if (s.includes('customer not visible in Admin after creation')) return { error:'Customer was created but not yet visible in Admin. Please try again.', technical:s };
+  if (s.includes('invalid or missing phone')) return { error:'Phone number is required and must have at least 10 digits.' };
+  if (s.includes('invalid or missing email')) return { error:'Email address is required and must be valid.' };
+  if (s.includes('missing password'))         return { error:'A password is required to create your account.' };
+  if (s.includes('Storefront token not configured')) return { error:'Storefront API access is not configured.' };
+  if (s.includes('ACCESS_DENIED'))            return { error:'Shopify permissions are missing (protected customer data scope).' };
+  if (s.includes('customer not visible in Admin after creation')) return { error:'Customer created but not yet visible in Admin. Please try again.' };
 
   // Generic fallback
-  return { error: s || 'Unknown error', technical: s };
+  return { error: s || 'Something went wrong. Please try again.' };
+}
+
+/* ---------- Customer update that tolerates phone errors ---------- */
+async function customerUpdateSoft(input){
+  const up = await gqlAdmin(Q.customerUpdate, { input });
+  const errs = up.customerUpdate?.userErrors || [];
+  if (!errs.length) return { ok:true, droppedPhone:false };
+
+  // If every error is phone-related, retry without phone
+  const phoneErrs = errs.filter(e =>
+    (e?.field||[]).join('.').toLowerCase().includes('phone') ||
+    String(e?.message||'').toLowerCase().includes('phone')
+  );
+
+  if (phoneErrs.length && phoneErrs.length === errs.length && input.phone){
+    const { phone, ...rest } = input;
+    const up2 = await gqlAdmin(Q.customerUpdate, { input: rest });
+    const errs2 = up2.customerUpdate?.userErrors || [];
+    if (!errs2.length) return { ok:true, droppedPhone:true };
+    return { ok:false, errs: errs2 };
+  }
+
+  return { ok:false, errs };
 }
 
 /* ---------- DataURL → Shopify Files ---------- */
@@ -271,18 +289,16 @@ export default async function handler(req,res){
 
       if (!id) return res.status(200).json({ ok:false, ...toPlainError('customer not visible in Admin after creation') });
 
-      const up = await gqlAdmin(Q.customerUpdate, { input: { id, ...baseInput } });
-      const errs = up.customerUpdate.userErrors;
-      if (errs?.length){
-        const plain = toPlainError(`customerUpdate: ${JSON.stringify(errs)}`);
+      const rUpd = await customerUpdateSoft({ id, ...baseInput });
+      if (!rUpd.ok){
+        const plain = toPlainError(`customerUpdate: ${JSON.stringify(rUpd.errs || [])}`);
         return res.status(200).json({ ok:false, ...plain });
       }
     } else {
       // Existing customer (cannot set/change password via Admin)
-      const up = await gqlAdmin(Q.customerUpdate, { input: { id, ...baseInput } });
-      const errs = up.customerUpdate.userErrors;
-      if (errs?.length){
-        const plain = toPlainError(`customerUpdate: ${JSON.stringify(errs)}`);
+      const rUpd = await customerUpdateSoft({ id, ...baseInput });
+      if (!rUpd.ok){
+        const plain = toPlainError(`customerUpdate: ${JSON.stringify(rUpd.errs || [])}`);
         return res.status(200).json({ ok:false, ...plain });
       }
     }
@@ -329,6 +345,11 @@ export default async function handler(req,res){
       mf.push({ namespace:'retainer', ownerId:id, key:'current_retainer_term', type:'single_line_text_field', value:String(p.retainer_term) });
     }
 
+    // (Optional) store normalized digits if provided
+    if (nonBlank(p.phone_digits)) {
+      mf.push({ namespace:'retainer', ownerId:id, key:'phone_digits', type:'single_line_text_field', value:String(p.phone_digits) });
+    }
+
     // Files → file_reference (VALUE = raw File GID string)
     if (sig.fileId) mf.push({ namespace:'retainer', ownerId:id, key:'signature',       type:'file_reference', value: sig.fileId });
     if (dl.fileId)  mf.push({ namespace:'retainer', ownerId:id, key:'drivers_license', type:'file_reference', value: dl.fileId  });
@@ -343,7 +364,7 @@ export default async function handler(req,res){
       }
     }
 
-    // No invite emails — account already created via Storefront
+    // Success
     return res.status(200).json({ ok:true, customer_id:id, customer_email:email });
   }catch(e){
     console.error('intake-upsert error', e);
