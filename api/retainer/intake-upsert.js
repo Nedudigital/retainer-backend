@@ -292,12 +292,23 @@ const password = lastNamePassword(p);
         return res.status(200).json({ ok:false, ...plain });
       }
 
-      // Fetch Admin ID then update Admin-side details (phone/address)
-      const found2 = await gqlAdmin(Q.customersByEmail, { q:`email:${JSON.stringify(email)}` });
-      id = found2.customers.nodes[0]?.id;
-      state = found2.customers.nodes[0]?.state;
+    // Wait for Admin API to catch up (Shopify delay)
+let id, state;
+for (let i = 0; i < 5; i++) {
+  const found2 = await gqlAdmin(Q.customersByEmail, { q:`email:${JSON.stringify(email)}` });
+  id = found2.customers.nodes[0]?.id;
+  state = found2.customers.nodes[0]?.state;
+  if (id) break;
+  await new Promise(r => setTimeout(r, 2000)); // wait 2 s, try again
+}
 
-      if (!id) return res.status(200).json({ ok:false, ...toPlainError('customer not visible in Admin after creation') });
+if (!id) {
+  return res.status(200).json({
+    ok: false,
+    error: "Customer created but Admin API hasn't indexed it yet. Please wait a few seconds and retry."
+  });
+}
+
 
       const rUpd = await customerUpdateSoft({ id, ...baseInput });
       if (!rUpd.ok){
