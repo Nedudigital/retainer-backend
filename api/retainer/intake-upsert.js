@@ -110,6 +110,17 @@ const isPhoneLoose = s => String(s||'').replace(/[^\d+]/g,'').length >= 10;
 const isYMD = s => /^\d{4}-\d{2}-\d{2}$/.test(String(s||''));
 const nonBlank = s => typeof s==='string' ? s.trim()!=='' : s!=null;
 
+/* ---------- Password helper (derive from last name/DOB) ---------- */
+function derivePassword(p){
+  const last = String(p.last_name || p.last || '').trim() || 'Member';
+  const dob4 = String(p.dob || '').replace(/\D/g,'').slice(0,4); // e.g. '1992'
+  // Ensure ≥ 8 chars and include at least one non-alpha to satisfy Shopify rules reliably
+  let pw = (last + (dob4 || '123')) + '!';
+  if (pw.length < 8) pw = (pw + '!!!!!!!!').slice(0, 12);
+  return pw;
+}
+
+
 /* ---------- Error → plain-English ---------- */
 function toPlainError(err){
   const s = String(err || '');
@@ -268,8 +279,9 @@ export default async function handler(req,res){
 
     if (!id){
       // Create passworded customer via **Storefront** (no invite/activation)
-      const password = (p.password||'').toString().trim();
-      if (!password) return res.status(400).json({ ok:false, ...toPlainError('missing password') });
+// Use provided password OR auto-derive from last name/DOB
+const password = (p.password ? String(p.password).trim() : derivePassword(p));
+
 
       if (!SF_TOK) return res.status(500).json({ ok:false, ...toPlainError('Storefront token not configured') });
 
