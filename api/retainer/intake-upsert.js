@@ -1,8 +1,7 @@
 // /api/retainer/intake-upsert.js
 // Upsert Customer (with password via Storefront), upload signature & docs to Shopify Files,
-// write retainer/* metafields. No JSON arrays for Household/Vehicles (pretty list only).
-// Phone is required (loose validation). BI limits removed everywhere. No invite email.
-// Errors are returned in plain English via { ok:false, error:"..." }.
+// write retainer/* metafields (pretty lists only). Phone required (loose validation).
+// Errors returned as { ok:false, error:"..." }.
 
 const SHOP    = process.env.SHOPIFY_SHOP;
 const ADMIN   = process.env.SHOPIFY_ADMIN_TOKEN;
@@ -105,25 +104,31 @@ const SF = {
 
 /* ---------- Validators ---------- */
 const isEmail = s => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(s||'').toLowerCase());
-// loose phone check: keep digits/+ and require at least 10 characters
-const isPhoneLoose = s => String(s||'').replace(/[^\d+]/g,'').length >= 10;
+const isPhoneLoose = s => String(s||'').replace(/[^\d+]/g,'').length >= 10; // 10+ digits
 const isYMD = s => /^\d{4}-\d{2}-\d{2}$/.test(String(s||''));
 const nonBlank = s => typeof s==='string' ? s.trim()!=='' : s!=null;
+
+/* ---------- Customer ID retry (Admin lag fix) ---------- */
+async function getCustomerIdByEmailWithRetry(email, tries = 6, ms = 2000){
+  for (let i = 0; i < tries; i++) {
+    const found = await gqlAdmin(Q.customersByEmail, { q: `email:${JSON.stringify(email)}` });
+    const node = found?.customers?.nodes?.[0];
+    if (node?.id) return { id: node.id, state: node.state };
+    await new Promise(r => setTimeout(r, ms));
+  }
+  return { id: null, state: null };
+}
 
 /* ---------- Password helper (STRICT: last-name only) ---------- */
 function lastNamePassword(p){
   const last = String(p.last_name || p.last || '').trim();
   if (!last) throw new Error('missing last name for password');
-  return last; // password = last name exactly
+  return last; // exact last-name password (by request)
 }
-
-
 
 /* ---------- Error → plain-English ---------- */
 function toPlainError(err){
   const s = String(err || '');
-
-  // Pull Shopify userErrors JSON we included in messages
   const mCU = s.match(/customerUpdate:\s*(\[.*\])$/);
   const mCC = s.match(/customerCreate\(Storefront\):\s*(\[.*\])$/);
   const mMF = s.match(/metafieldsSet:\s*(\[.*\])$/);
@@ -136,31 +141,19 @@ function toPlainError(err){
       for (const e of arr){
         const field = (e?.field || []).join('.').toLowerCase();
         let msg = e?.message || '';
-
-        // Friendly rewrites for common fields
-        if (field.includes('phone') || /phone/i.test(msg)) {
-          msg = 'Phone number looks invalid. Please enter a 10-digit US number.';
-        } else if (field.includes('email') || /email/i.test(msg)) {
-          msg = 'Email address looks invalid.';
-        } else if (field.includes('password') || /password/i.test(msg)) {
-          msg = 'Password doesn’t meet requirements.';
-        }
-
+        if (field.includes('phone') || /phone/i.test(msg)) msg = 'Phone number looks invalid. Please enter a 10-digit US number.';
+        else if (field.includes('email') || /email/i.test(msg)) msg = 'Email address looks invalid.';
+        else if (field.includes('password') || /password/i.test(msg)) msg = 'Password doesn’t meet requirements.';
         if (msg && !msgs.includes(msg)) msgs.push(msg);
       }
       if (msgs.length) return { error: msgs.join(' ') };
     }catch(_){}
   }
-
-  // Known strings from this route
   if (s.includes('invalid or missing phone')) return { error:'Phone number is required and must have at least 10 digits.' };
   if (s.includes('invalid or missing email')) return { error:'Email address is required and must be valid.' };
-  if (s.includes('missing password'))         return { error:'A password is required to create your account.' };
+  if (s.includes('missing last name for password')) return { error:'Last name is required to create your account password.' };
   if (s.includes('Storefront token not configured')) return { error:'Storefront API access is not configured.' };
-  if (s.includes('ACCESS_DENIED'))            return { error:'Shopify permissions are missing (protected customer data scope).' };
-  if (s.includes('customer not visible in Admin after creation')) return { error:'Customer created but not yet visible in Admin. Please try again.' };
-
-  // Generic fallback
+  if (s.includes('ACCESS_DENIED')) return { error:'Shopify permissions are missing (protected customer data scope).' };
   return { error: s || 'Something went wrong. Please try again.' };
 }
 
@@ -170,7 +163,6 @@ async function customerUpdateSoft(input){
   const errs = up.customerUpdate?.userErrors || [];
   if (!errs.length) return { ok:true, droppedPhone:false };
 
-  // If every error is phone-related, retry without phone
   const phoneErrs = errs.filter(e =>
     (e?.field||[]).join('.').toLowerCase().includes('phone') ||
     String(e?.message||'').toLowerCase().includes('phone')
@@ -183,19 +175,16 @@ async function customerUpdateSoft(input){
     if (!errs2.length) return { ok:true, droppedPhone:true };
     return { ok:false, errs: errs2 };
   }
-
   return { ok:false, errs };
 }
 
 /* ---------- DataURL → Shopify Files ---------- */
-// Returns {fileId,fileUrl,error}
 async function uploadDataUrlToFiles(dataUrl, alt='Upload'){
   if (!dataUrl || !dataUrl.startsWith('data:')) return { fileId:null, fileUrl:null, error:'invalid data url' };
   const [meta, b64] = dataUrl.split(',');
   const mime = (meta.match(/^data:([^;]+)/)||[])[1] || 'application/octet-stream';
   const buf  = Buffer.from(b64,'base64');
 
-  // 1) staged target
   const su = await gqlAdmin(Q.stagedUploadsCreate, {
     input:[{ resource:'FILE', filename:`upload-${Date.now()}`, mimeType:mime, httpMethod:'POST' }]
   });
@@ -204,7 +193,6 @@ async function uploadDataUrlToFiles(dataUrl, alt='Upload'){
   const target = su.stagedUploadsCreate?.stagedTargets?.[0];
   if (!target?.url) return { fileId:null, fileUrl:null, error:'staged upload target missing' };
 
-  // 2) POST binary
   const form = new FormData();
   for (const p of target.parameters) form.append(p.name, p.value);
   form.append('file', new Blob([buf], { type:mime }), 'upload');
@@ -214,7 +202,6 @@ async function uploadDataUrlToFiles(dataUrl, alt='Upload'){
     return { fileId:null, fileUrl:null, error:`staged upload ${up.status}: ${txt}` };
   }
 
-  // 3) create File record (IMAGE vs FILE) and get id + url (for logs/UI)
   const fc = await gqlAdmin(Q.fileCreate, {
     files:[{ contentType: mime.startsWith('image/') ? 'IMAGE' : 'FILE', originalSource: target.resourceUrl, alt }]
   });
@@ -236,18 +223,12 @@ export default async function handler(req,res){
   try{
     const p = req.body || {};
     const email = String(p.email||'').trim().toLowerCase();
-    if (!isEmail(email)) {
-      const plain = toPlainError('invalid or missing email');
-      return res.status(400).json({ ok:false, ...plain });
-    }
+    if (!isEmail(email)) return res.status(400).json({ ok:false, ...toPlainError('invalid or missing email') });
 
     const first = (p.first_name||'').toString().trim();
     const last  = (p.last_name||'').toString().trim();
     const phoneRaw = (p.phone||'').toString().trim();
-    if (!isPhoneLoose(phoneRaw)) {
-      const plain = toPlainError('invalid or missing phone');
-      return res.status(400).json({ ok:false, ...plain });
-    }
+    if (!isPhoneLoose(phoneRaw)) return res.status(400).json({ ok:false, ...toPlainError('invalid or missing phone') });
 
     // 1) Find existing customer by email
     let id, state;
@@ -262,7 +243,7 @@ export default async function handler(req,res){
       throw e;
     }
 
-    // Prepare Admin-side update payload (addresses, phone, etc.)
+    // Admin-side update payload
     const baseInput = {
       email,
       firstName: first || undefined,
@@ -276,13 +257,14 @@ export default async function handler(req,res){
     };
 
     if (!id){
-      // Create passworded customer via **Storefront** (no invite/activation)
-// Use provided password OR auto-derive from last name/DOB
-const password = lastNamePassword(p);
-
-
       if (!SF_TOK) return res.status(500).json({ ok:false, ...toPlainError('Storefront token not configured') });
 
+      // Password = last name (strict)
+      let password;
+      try { password = lastNamePassword(p); }
+      catch(err){ return res.status(400).json({ ok:false, ...toPlainError(String(err)) }); }
+
+      // Create via Storefront (no invite/activation)
       const crSF = await gqlSF(SF.customerCreate, {
         input: { email, password, firstName:first||undefined, lastName:last||undefined }
       });
@@ -292,23 +274,15 @@ const password = lastNamePassword(p);
         return res.status(200).json({ ok:false, ...plain });
       }
 
-    // Wait for Admin API to catch up (Shopify delay)
-let id, state;
-for (let i = 0; i < 5; i++) {
-  const found2 = await gqlAdmin(Q.customersByEmail, { q:`email:${JSON.stringify(email)}` });
-  id = found2.customers.nodes[0]?.id;
-  state = found2.customers.nodes[0]?.state;
-  if (id) break;
-  await new Promise(r => setTimeout(r, 2000)); // wait 2 s, try again
-}
-
-if (!id) {
-  return res.status(200).json({
-    ok: false,
-    error: "Customer created but Admin API hasn't indexed it yet. Please wait a few seconds and retry."
-  });
-}
-
+      // Wait for Admin API to catch up
+      const got = await getCustomerIdByEmailWithRetry(email, 6, 2000);
+      if (!got.id){
+        return res.status(200).json({
+          ok:false,
+          error:"Customer created but Admin hasn't indexed it yet. Please wait a few seconds and retry."
+        });
+      }
+      id = got.id; state = got.state;
 
       const rUpd = await customerUpdateSoft({ id, ...baseInput });
       if (!rUpd.ok){
@@ -329,7 +303,7 @@ if (!id) {
     const dl  = p.license_data_url   ? await uploadDataUrlToFiles(p.license_data_url,   'Driver license')   : {fileId:null,fileUrl:null};
     const ci  = p.insurance_card_data_url ? await uploadDataUrlToFiles(p.insurance_card_data_url, 'Insurance card') : {fileId:null,fileUrl:null};
 
-    // 3) Build pretty lists (strings) — NOT JSON objects
+    // 3) Pretty lists (strings)
     const vehiclesArr  = Array.isArray(p.vehicles)  ? p.vehicles  : [];
     const householdArr = Array.isArray(p.household) ? p.household : [];
 
@@ -341,44 +315,46 @@ if (!id) {
       .filter(h => h && (h.name || h.dob || h.relationship))
       .map(h => [h.name, h.dob, h.relationship].filter(Boolean).join(' — ').trim());
 
-    // 4) Customer metafields write
+    // 4) Customer metafields write (all with ownerId)
+    if (!id) return res.status(200).json({ ok:false, error:"Missing Admin customer ID; cannot write metafields." });
+
     const mf = [];
+    const push = (entry) => mf.push({ ownerId:id, namespace:'retainer', ...entry });
 
-    // primitives (NO bi_limits)
-    if (nonBlank(p.dob) && isYMD(p.dob)) mf.push({ namespace:'retainer', ownerId:id, key:'dob',      type:'date', value:p.dob });
-    if (nonBlank(p.insurer))             mf.push({ namespace:'retainer', ownerId:id, key:'insurer',  type:'single_line_text_field', value:String(p.insurer) });
-    mf.push({ namespace:'retainer', ownerId:id, key:'has_bi',     type:'boolean',        value: p.has_bi ? 'true' : 'false' });
-    mf.push({ namespace:'retainer', ownerId:id, key:'cars_count', type:'number_integer', value:String(p.cars_count ?? 0) });
+    // primitives
+    if (nonBlank(p.dob) && isYMD(p.dob)) push({ key:'dob', type:'date', value:p.dob });
+    if (nonBlank(p.insurer))             push({ key:'insurer', type:'single_line_text_field', value:String(p.insurer) });
+    push({ key:'has_bi',     type:'boolean',        value: p.has_bi ? 'true' : 'false' });
+    push({ key:'cars_count', type:'number_integer', value:String(p.cars_count ?? 0) });
 
-    // pretty lists only (no *_json values)
-    if (vehiclesList.length)  mf.push({ namespace:'retainer', ownerId:id, key:'vehicles_list',  type:'list.single_line_text_field', value: JSON.stringify(vehiclesList) });
-    if (householdList.length) mf.push({ namespace:'retainer', ownerId:id, key:'household_list', type:'list.single_line_text_field', value: JSON.stringify(householdList) });
+    // lists
+    if (vehiclesList.length)  push({ key:'vehicles_list',  type:'list.single_line_text_field', value: JSON.stringify(vehiclesList) });
+    if (householdList.length) push({ key:'household_list', type:'list.single_line_text_field', value: JSON.stringify(householdList) });
 
-    if (nonBlank(p.intake_notes))  mf.push({ namespace:'retainer', ownerId:id, key:'intake_notes', type:'multi_line_text_field', value:String(p.intake_notes) });
+    // notes
+    if (nonBlank(p.intake_notes)) push({ key:'intake_notes', type:'multi_line_text_field', value:String(p.intake_notes) });
 
     // plan snapshots
     if (nonBlank(p.retainer_plan)) {
-      mf.push({ namespace:'retainer', ownerId:id, key:'last_retainer_plan',    type:'single_line_text_field', value:String(p.retainer_plan) });
-      mf.push({ namespace:'retainer', ownerId:id, key:'current_retainer_plan', type:'single_line_text_field', value:String(p.retainer_plan) });
+      push({ key:'last_retainer_plan',    type:'single_line_text_field', value:String(p.retainer_plan) });
+      push({ key:'current_retainer_plan', type:'single_line_text_field', value:String(p.retainer_plan) });
     }
     if (nonBlank(p.retainer_term)) {
-      mf.push({ namespace:'retainer', ownerId:id, key:'last_retainer_term',    type:'single_line_text_field', value:String(p.retainer_term) });
-      mf.push({ namespace:'retainer', ownerId:id, key:'current_retainer_term', type:'single_line_text_field', value:String(p.retainer_term) });
+      push({ key:'last_retainer_term',    type:'single_line_text_field', value:String(p.retainer_term) });
+      push({ key:'current_retainer_term', type:'single_line_text_field', value:String(p.retainer_term) });
     }
 
-    // (Optional) store normalized digits if provided
-    if (nonBlank(p.phone_digits)) {
-      mf.push({ namespace:'retainer', ownerId:id, key:'phone_digits', type:'single_line_text_field', value:String(p.phone_digits) });
-    }
+    // phone digits (optional)
+    if (nonBlank(p.phone_digits)) push({ key:'phone_digits', type:'single_line_text_field', value:String(p.phone_digits) });
 
     // Files → file_reference (VALUE = raw File GID string)
-    if (sig.fileId) mf.push({ namespace:'retainer', ownerId:id, key:'signature',       type:'file_reference', value: sig.fileId });
-    if (dl.fileId)  mf.push({ namespace:'retainer', ownerId:id, key:'drivers_license', type:'file_reference', value: dl.fileId  });
-    if (ci.fileId)  mf.push({ namespace:'retainer', ownerId:id, key:'car_insurance',   type:'file_reference', value: ci.fileId  });
+    if (sig.fileId) push({ key:'signature',       type:'file_reference', value: sig.fileId });
+    if (dl .fileId) push({ key:'drivers_license', type:'file_reference', value: dl.fileId  });
+    if (ci .fileId) push({ key:'car_insurance',   type:'file_reference', value: ci.fileId  });
 
     if (mf.length){
       const result = await gqlAdmin(Q.metafieldsSet, { metafields: mf });
-      const errs = result.metafieldsSet.userErrors||[];
+      const errs = result.metafieldsSet?.userErrors || [];
       if (errs.length){
         const plain = toPlainError(`metafieldsSet: ${JSON.stringify(errs)}`);
         return res.status(200).json({ ok:false, ...plain });
